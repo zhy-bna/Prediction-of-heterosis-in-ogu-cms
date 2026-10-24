@@ -1,11 +1,14 @@
+# ============================================================
 # Script: Calculate additive and dominance PGSI per window
+# Scoring rule: identical/complementary homozygous sites count as 2,
+# denominator is 2 x n_valid (consistent with the original script logic)
+# ============================================================
 
 library(data.table)
 library(vcfR)
 library(parallel)
 
-# defined parameters
-
+# ---------- User parameters ----------
 vcf_file        <- "/biodata/zhy/pgsi_ad/Brapa_napus.raw.filter.snp.anno.vcf"
 ref_genome      <- "/biodata/zhy/pgsi_ad/Brassica_napus.Darmor.v4.1.genome.fa"
 samtools_path   <- "/database/biosoft/samtools1.9/samtools"
@@ -29,8 +32,7 @@ keep_chromosomes <- c(
   "chrAnn_random", "chrCnn_random", "chrUnn_random"
 )
 
-# read window files
-
+# ---------- Read window files ----------
 read_window_file <- function(file_path, keep_chr) {
   dt <- fread(file_path, header = FALSE, col.names = "window_id", fill = TRUE)
   dt <- dt[!is.na(window_id) & window_id != ""]
@@ -56,9 +58,7 @@ read_window_file <- function(file_path, keep_chr) {
   return(windows)
 }
 
-
-# Assign SNPs to windows
-
+# ---------- Assign SNPs to windows ----------
 assign_snps_to_windows <- function(snp_pos, windows) {
   snp_pos_copy <- copy(snp_pos)
   snp_pos_copy[, pos_end := pos]
@@ -70,9 +70,7 @@ assign_snps_to_windows <- function(snp_pos, windows) {
             type = "within")
 }
 
-
-#compute additive and dominance PGSI per window
-
+# ---------- Compute additive and dominance PGSI per window ----------
 compute_window_stats <- function(wid, snp_in_window, gt_mat, cms_ids, restorer_ids) {
   snp_idx <- snp_in_window[window_id == wid, snp_id]
   if (length(snp_idx) == 0) return(NULL)
@@ -87,9 +85,12 @@ compute_window_stats <- function(wid, snp_in_window, gt_mat, cms_ids, restorer_i
   rest_cols <- match(restorer_ids, colnames(gt_win))
   if (any(is.na(cms_cols)) || any(is.na(rest_cols))) return(NULL)
   
-  count_00_mat  <- matrix(0L, nrow = n_cms, ncol = n_rest)
-  count_11_mat  <- matrix(0L, nrow = n_cms, ncol = n_rest)
-  count_dom_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)
+  # Initialize count matrices
+  count_00_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)   # Both 0/0
+  count_11_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)   # Both 1/1
+  count_22_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)   # Both 2/2
+  count_het_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)  # Both heterozygous (0/1-0/1 or 1/0-1/0)
+  count_dom_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)  # Complementary homozygous (0/0-2/2 or 2/2-0/0)
   count_valid_mat <- matrix(0L, nrow = n_cms, ncol = n_rest)
   
   gt_int <- as.matrix(gt_win)
@@ -102,6 +103,7 @@ compute_window_stats <- function(wid, snp_in_window, gt_mat, cms_ids, restorer_i
     rest_valid <- !is.na(rest_vals)
     valid_mat <- outer(cms_valid, rest_valid, `&`)
     
+    # --- Additive PGSI: both parents are homozygous and identical (0/0-0/0 or 1/1-1/1) ---
     cms_is_0 <- cms_vals == 0L
     cms_is_1 <- cms_vals == 1L
     cms_is_2 <- cms_vals == 2L
@@ -117,46 +119,56 @@ compute_window_stats <- function(wid, snp_in_window, gt_mat, cms_ids, restorer_i
     rest_is_2[is.na(rest_is_2)] <- FALSE
     
     mat_00 <- outer(cms_is_0, rest_is_0, `&`) & valid_mat
-    mat_11 <- outer(cms_is_2, rest_is_2, `&`) & valid_mat
-    mat_dom <- (
-      outer(cms_is_0, rest_is_1, `&`) |
-        outer(cms_is_1, rest_is_0, `&`) |
-        outer(cms_is_1, rest_is_2, `&`) |
-        outer(cms_is_2, rest_is_1, `&`)
-    ) & valid_mat
+    mat_11 <- outer(cms_is_1, rest_is_1, `&`) & valid_mat
+    mat_22 <- outer(cms_is_2, rest_is_2, `&`) & valid_mat
     
-    count_00_mat   <- count_00_mat + mat_00
-    count_11_mat   <- count_11_mat + mat_11
-    count_dom_mat  <- count_dom_mat + mat_dom
+    # --- Heterozygous similarity PGSI: both parents are heterozygous (0/1-0/1 or 1/0-1/0) ---
+    mat_het <- outer(cms_is_1, rest_is_1, `&`) & valid_mat  # 1 indicates heterozygous
+    
+    # --- Dominance PGSI: complementary homozygous (0/0-2/2 or 2/2-0/0) ---
+    mat_dom <- (outer(cms_is_0, rest_is_2, `&`) | outer(cms_is_2, rest_is_0, `&`)) & valid_mat
+    
+    count_00_mat <- count_00_mat + mat_00
+    count_11_mat <- count_11_mat + mat_11
+    count_22_mat <- count_22_mat + mat_22
+    count_het_mat <- count_het_mat + mat_het
+    count_dom_mat <- count_dom_mat + mat_dom
     count_valid_mat <- count_valid_mat + valid_mat
   }
   
+  # Calculate three PGSI types.
+  # Scoring rule: identical/complementary homozygous sites count as 2,
+  # denominator is 2 x n_valid (consistent with the original script logic).
+  # Note: additive only includes 0/0-0/0 and 1/1-1/1 (excluding 2/2-2/2)
   res <- data.table(
     window_id = wid,
     cms       = rep(cms_ids, each = n_rest),
     restorer  = rep(restorer_ids, times = n_cms),
-    add_PGSI  = as.vector((count_00_mat + count_11_mat) / count_valid_mat),
-    dom_PGSI  = as.vector(count_dom_mat / count_valid_mat)
+    add_PGSI  = as.vector(2 * (count_00_mat + count_22_mat) / (2 * count_valid_mat)),
+    het_PGSI  = as.vector(2 * count_het_mat / (2 * count_valid_mat)),
+    dom_PGSI  = as.vector(2 * count_dom_mat / (2 * count_valid_mat))
   )
   
+  # Handle infinite values and NAs
   res[is.infinite(add_PGSI) | is.nan(add_PGSI), add_PGSI := NA_real_]
+  res[is.infinite(het_PGSI) | is.nan(het_PGSI), het_PGSI := NA_real_]
   res[is.infinite(dom_PGSI) | is.nan(dom_PGSI), dom_PGSI := NA_real_]
+  
   return(res)
 }
 
-
-# Create .fai index if needed
+# ---------- Create .fai index if needed ----------
 fai_file <- paste0(ref_genome, ".fai")
 if (!file.exists(fai_file)) {
   system(paste(samtools_path, "faidx", ref_genome))
 }
 
-# Read sample info
+# ---------- Read sample info ----------
 sample_info <- fread(sample_info_file, encoding = "UTF-8")
 cms_ids      <- sample_info[Type == "CMS", SampleID]
 restorer_ids <- sample_info[Type == "Restorer", SampleID]
 
-# Read VCF and extract genotypes
+# ---------- Read VCF and extract genotypes ----------
 vcf    <- read.vcfR(vcf_file, verbose = FALSE)
 gt_raw <- extract.gt(vcf, element = "GT", as.numeric = FALSE)
 snp_pos <- data.table(
@@ -176,7 +188,7 @@ gt_num <- apply(gt_raw, 2, function(x) {
 })
 rownames(gt_num) <- snp_pos$snp_id
 
-# Process each window size
+# ---------- Process each window size ----------
 for (idx in seq_along(window_files)) {
   win_file <- window_files[idx]
   ws <- window_sizes[idx]
